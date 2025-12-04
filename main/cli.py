@@ -1,6 +1,6 @@
 import argparse
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 from . import (
     advisor,
@@ -214,6 +214,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="online 模式：将抓取到的 SQL 落盘保存，便于复用。",
     )
     replay_cmd.add_argument(
+        "--baseline-source",
+        choices=["oracle", "file"],
+        help="性能评估时的 Oracle 基线来源：oracle=在线查询 v$sql（online/jsonl/lines）；file=基线映射文件。",
+    )
+    replay_cmd.add_argument(
+        "--baseline-file",
+        help="当 baseline-source=file 时，提供 json 格式 {\"sql_text\": avg_elapsed_ms} 的映射文件。",
+    )
+    replay_cmd.add_argument(
         "--oma-cli",
         default=None,
         help="dbreplay 模式可选：调用 OMA 分析 DB Replay 目录后读取 sqls.txt，不填默认使用 config.ini 的 oma.start_script。",
@@ -230,8 +239,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""示例:
   # 12 小时，每5秒轮询，写入 JSONL
   python3 run.py capture --output captured_sqls.jsonl --duration-seconds 43200 --interval-seconds 5 --limit-per-interval 200
-  # 使用 config.ini 的 capture.schemas 并去重
-  python3 run.py capture --respect-config-schemas --dedup --output captured_sqls.jsonl""",
+  # 默认使用 config.ini 的 capture.schemas；若需额外过滤或去重：
+  python3 run.py capture --dedup --schema HR --module APP --output captured_sqls.jsonl""",
     )
     capture_cmd.add_argument(
         "--output",
@@ -275,11 +284,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--module",
         action="append",
         help="仅捕获指定 module（可多次传递）。默认不过滤。",
-    )
-    capture_cmd.add_argument(
-        "--respect-config-schemas",
-        action="store_true",
-        help="若配置文件 capture.schemas 存在，则使用该列表作为过滤（默认忽略配置）。",
     )
 
     oma_cmd = sub.add_parser(
@@ -381,6 +385,7 @@ def _run_replay(cfg, args) -> int:
     ob_client = OceanBaseClient(cfg.oceanbase)
     mode = args.mode
     source_type = args.source_type
+    oracle_baselines: Dict[str, float] = {}
     if source_type in ("dbreplay", "jsonl", "lines"):
         if not args.source_path:
             raise SystemExit("source-type 为 dbreplay/jsonl/lines 时必须提供 --source-path。")
@@ -396,9 +401,12 @@ def _run_replay(cfg, args) -> int:
                 oma_extra=args.oma_extra,
                 sqls_file=None,
                 sqls_format="lines",
+                oracle_baselines=oracle_baselines if mode == "perf" else None,
             )
         else:
             fmt = "jsonl" if source_type == "jsonl" else "lines"
+            if mode == "perf" and args.baseline_source == "file":
+                oracle_baselines = _load_baseline_file(args.baseline_file)
             result = replay.run_offline(
                 ob_client=ob_client,
                 capture_dir=".",
@@ -408,6 +416,7 @@ def _run_replay(cfg, args) -> int:
                 oma_cli=None,
                 sqls_file=args.source_path,
                 sqls_format=fmt,
+                oracle_baselines=oracle_baselines if mode == "perf" else None,
             )
     else:
         ora_client = OracleClient(cfg.oracle)
@@ -421,6 +430,7 @@ def _run_replay(cfg, args) -> int:
             store_file=args.store_file,
             schemas=args.schema,
             modules=args.module,
+            baseline_source=args.baseline_source,
         )
 
     _print_replay_result(result, compat_only=(mode == "compat"))
@@ -448,6 +458,11 @@ def _print_replay_result(result, compat_only: bool) -> None:
             )
             if bench.errors:
                 print("   errors:", "; ".join(bench.errors))
+            baseline = (result.get("oracle_baselines") or {}).get(bench.sql)
+            if baseline is not None:
+                delta = bench.avg_ms - baseline
+                print("   Oracle avg=%.2f ms, OB avg=%.2f ms, delta=%.2f ms (%s)" %
+                      (baseline, bench.avg_ms, delta, "更快" if delta < 0 else "更慢"))
 
     if result.get("oma_output"):
         print("OMA 输出：")
@@ -457,9 +472,7 @@ def _print_replay_result(result, compat_only: bool) -> None:
 def _run_capture(cfg, args) -> int:
     ora_client = OracleClient(cfg.oracle)
     include_binds = not args.no_binds
-    schemas = args.schema
-    if args.respect_config_schemas and cfg.capture_schemas:
-        schemas = cfg.capture_schemas if not schemas else schemas + cfg.capture_schemas
+    schemas = args.schema or cfg.capture_schemas
     count = capture.stream_sqls(
         ora_client=ora_client,
         output_file=args.output,
@@ -474,6 +487,21 @@ def _run_capture(cfg, args) -> int:
     )
     print("捕获完成，输出文件 %s，共 %s 条 SQL。" % (args.output, count))
     return 0
+
+
+def _load_baseline_file(path: Optional[str]) -> Dict[str, float]:
+    import json
+    if not path:
+        raise SystemExit("baseline-source=file 时需要提供 --baseline-file（json 映射 {sql_text: avg_ms}）。")
+    with open(path, "r") as fp:
+        data = json.load(fp)
+    baselines: Dict[str, float] = {}
+    for k, v in data.items():
+        try:
+            baselines[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return baselines
 
 
 def _run_oma(cfg, args) -> int:

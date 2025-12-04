@@ -20,6 +20,7 @@ def run_offline(
     oma_extra: Optional[str] = None,
     sqls_file: Optional[str] = None,
     sqls_format: str = "lines",
+    oracle_baselines: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Sequence]:
     """
     离线模式：给定 DB Replay 捕获目录，调用 OMA 分析后，在 OB 上做兼容/性能评估。
@@ -53,7 +54,7 @@ def run_offline(
                     sql,
                     iterations=iterations,
                     concurrency=concurrency,
-                    oracle_baseline_ms=None,
+                    oracle_baseline_ms=(oracle_baselines or {}).get(sql),
                 )
             )
 
@@ -62,6 +63,7 @@ def run_offline(
         "compat": compat_results,
         "bench": bench_results,
         "oma_output": oma_output,
+        "oracle_baselines": oracle_baselines or {},
     }
 
 
@@ -75,12 +77,15 @@ def run_online(
     store_file: Optional[str] = None,
     schemas: Optional[Sequence[str]] = None,
     modules: Optional[Sequence[str]] = None,
+    baseline_source: Optional[str] = None,
 ) -> Dict[str, Sequence]:
     """
     在线模式：实时从 Oracle 抓取最近 SQL（v$sql），可落盘，再在 OB 回放。
     mode: compat 或 perf。
     """
-    sqls = fetch_recent_sqls(ora_client, limit=limit, schemas=schemas, modules=modules)
+    sqls, baselines = fetch_recent_sqls(
+        ora_client, limit=limit, schemas=schemas, modules=modules, return_baseline=True
+    )
     if store_file:
         with open(store_file, "w") as fp:
             for sql in sqls:
@@ -100,7 +105,7 @@ def run_online(
                     sql,
                     iterations=iterations,
                     concurrency=concurrency,
-                    oracle_baseline_ms=None,
+                    oracle_baseline_ms=baselines.get(sql),
                 )
             )
 
@@ -108,6 +113,7 @@ def run_online(
         "sqls": sqls,
         "compat": compat_results,
         "bench": bench_results,
+        "oracle_baselines": baselines,
     }
 
 
@@ -116,9 +122,11 @@ def fetch_recent_sqls(
     limit: int = 20,
     schemas: Optional[Sequence[str]] = None,
     modules: Optional[Sequence[str]] = None,
-) -> List[str]:
+    return_baseline: bool = False,
+) -> Tuple[List[str], Dict[str, float]]:
     """
-    简单从 v$sql 抓取最近活跃的 SQL 文本，排除空 SQL；可按 schema/module 过滤。
+    从 v$sql 抓取最近活跃的 SQL，含可选 schema/module 过滤。
+    return_baseline=True 时，返回 oracle_baselines: {sql_text: avg_elapsed_ms}
     """
     where_filters = ["sql_text IS NOT NULL"]
     params: Dict[str, Any] = {"limit": limit}
@@ -128,22 +136,32 @@ def fetch_recent_sqls(
         where_filters.append("module IN (%s)" % _list_to_binds("mod", modules, params))
     where_clause = " AND ".join(where_filters)
     stmt = f"""
-    SELECT sql_text FROM (
-        SELECT sql_text
-        FROM v$sql
-        WHERE {where_clause}
-        ORDER BY last_active_time DESC
-    )
-    WHERE ROWNUM <= :limit
+    SELECT sql_text,
+           elapsed_time,
+           executions
+      FROM (
+            SELECT sql_text,
+                   elapsed_time,
+                   executions
+              FROM v$sql
+             WHERE {where_clause}
+             ORDER BY last_active_time DESC
+           )
+     WHERE ROWNUM <= :limit
     """
     result = ora_client.execute(stmt, params=params, fetch=True)
     sqls: List[str] = []
+    baselines: Dict[str, float] = {}
     if result.success and result.rows:
         for row in result.rows:
-            sql_text = row[0]
-            if sql_text:
-                sqls.append(str(sql_text).strip())
-    return sqls
+            sql_text, elapsed_time_us, executions = row
+            if not sql_text:
+                continue
+            sql_text = str(sql_text).strip()
+            sqls.append(sql_text)
+            if return_baseline and executions and elapsed_time_us:
+                baselines[sql_text] = float(elapsed_time_us) / 1000.0 / float(executions)
+    return sqls, baselines
 
 
 def _list_to_binds(prefix: str, values: Sequence[str], params: Dict[str, Any]) -> str:

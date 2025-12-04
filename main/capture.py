@@ -20,11 +20,14 @@ def stream_sqls(
 ) -> int:
     """
     按固定间隔从 Oracle v$sql 抽取最近活跃的 SQL，包含绑定变量信息（若有）。
-    可选过滤 schema/module，支持去重。
+    可选过滤 schema/module，支持去重，附带执行统计（elapsed/cpu/buffer/disk/rows/fetches/executions）。
 
     写入 JSON Lines，格式：
     {"sql_id": "...", "child_number": 0, "schema": "...", "module": "...",
-     "last_active_time": "2024-05-01T12:00:00", "sql_text": "...", "binds": [{"position":1,...}]}
+     "last_active_time": "2024-05-01T12:00:00", "sql_text": "...",
+     "binds": [{"position":1,...}],
+     "executions": 10, "avg_elapsed_ms": 1.23, "elapsed_time_us": 12345, "cpu_time_us": 10000,
+     "buffer_gets": 100, "disk_reads": 10, "rows_processed": 20, "fetches": 2}
 
     返回捕获到的 SQL 数量（写入行数）。
     """
@@ -41,7 +44,21 @@ def stream_sqls(
             if rows:
                 last_time = rows[-1][4]
             for row in rows:
-                sql_id, child, schema, module, last_active, sql_text = row
+                (
+                    sql_id,
+                    child,
+                    schema,
+                    module,
+                    last_active,
+                    sql_text,
+                    elapsed_us,
+                    executions,
+                    cpu_us,
+                    buffer_gets,
+                    disk_reads,
+                    rows_proc,
+                    fetches,
+                ) = row
                 if include_schemas_set is not None:
                     if (schema or "").lower() not in include_schemas_set:
                         continue
@@ -53,6 +70,9 @@ def stream_sqls(
                 if dedup and key in seen_keys:
                     continue
                 binds = _fetch_binds(ora_client, sql_id, child) if include_binds else []
+                avg_elapsed_ms = None
+                if executions and executions > 0 and elapsed_us is not None:
+                    avg_elapsed_ms = float(elapsed_us) / 1000.0 / float(executions)
                 record = {
                     "sql_id": sql_id,
                     "child_number": child,
@@ -61,6 +81,14 @@ def stream_sqls(
                     "last_active_time": _fmt_time(last_active),
                     "sql_text": sql_text,
                     "binds": binds,
+                    "executions": executions,
+                    "avg_elapsed_ms": avg_elapsed_ms,
+                    "elapsed_time_us": elapsed_us,
+                    "cpu_time_us": cpu_us,
+                    "buffer_gets": buffer_gets,
+                    "disk_reads": disk_reads,
+                    "rows_processed": rows_proc,
+                    "fetches": fetches,
                 }
                 fp.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fp.flush()
@@ -80,14 +108,28 @@ def _fetch_sqls_since(
            parsing_schema_name,
            module,
            last_active_time,
-           sql_text
+           sql_text,
+           elapsed_time,
+           executions,
+           cpu_time,
+           buffer_gets,
+           disk_reads,
+           rows_processed,
+           fetches
       FROM (
             SELECT sql_id,
                    child_number,
                    parsing_schema_name,
                    module,
                    last_active_time,
-                   sql_text
+                   sql_text,
+                   elapsed_time,
+                   executions,
+                   cpu_time,
+                   buffer_gets,
+                   disk_reads,
+                   rows_processed,
+                   fetches
               FROM v$sql
              WHERE last_active_time > :last_time
              ORDER BY last_active_time

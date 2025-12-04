@@ -72,7 +72,8 @@ python3 run.py oma --mode ANALYZE --from-type DB --schemas OMS_USER --report-roo
 ### 2) 在线捕获（Python 轮询 v$sql）
 - 长时间捕获含绑定：`python3 run.py capture --output captured_sqls.jsonl --duration-seconds 43200 --interval-seconds 5 --limit-per-interval 200`
 - 过滤/去重示例：`python3 run.py capture --dedup --schema HR --module APP --output captured_sqls.jsonl`
-- 使用 config.ini 的 capture.schemas：`python3 run.py capture --respect-config-schemas --output captured_sqls.jsonl`
+- 默认使用 config.ini 的 capture.schemas；若需覆盖可直接传 `--schema ...`
+- 输出 JSONL 每行包含 SQL、绑定、以及执行统计（executions、avg_elapsed_ms、elapsed_time_us、cpu_time_us、buffer_gets、disk_reads、rows_processed、fetches）。
 - 说明：v$sql/v$sql_bind_capture 在高并发下可能采样/覆盖，如需尽量完整的流量建议用 DB Replay。
 
 ### 3) 在线捕获（OMA 直连源库采集）
@@ -99,6 +100,9 @@ python3 run.py oma --mode ANALYZE --from-type DB --schemas OMS_USER --report-roo
 - 源为捕获 JSONL：`python3 run.py replay --source-type jsonl --source-path captured_sqls.jsonl --mode compat`（性能同上，加 --mode perf 等）。
 - 源为文本行文件：`python3 run.py replay --source-type lines --source-path sqls.txt --mode perf --concurrency 4 --iterations 3`
 - 在线抓取后立即评估：`python3 run.py replay --source-type online --limit 30 --mode compat --store-file captured.sqls`；性能模式加 `--mode perf --concurrency ...`
+- 性能对比中的 Oracle 基线：
+  - online/jsonl/lines：可用 `--baseline-source oracle`（在线查询 v$sql）或 `--baseline-source file --baseline-file baseline.json`（格式 { "sql_text": avg_elapsed_ms }）。
+  - dbreplay：可选先用 OMA 分析生成 sqls.txt，再用 replay perf 模式；如需 Oracle 基线，可自备映射文件或在回放前从 Oracle 端导出基线数据。
 
 ### 6) OMA 评估/回放（封装 start.sh 常用参数）
 - DB Replay 目录，兼容/静态性能评估：  

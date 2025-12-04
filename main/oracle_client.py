@@ -27,7 +27,7 @@ class OracleClient:
         if self.config.schema:
             cursor = self._conn.cursor()
             cursor.execute(
-                "ALTER SESSION SET CURRENT_SCHEMA = :schema", {"schema": self.config.schema}
+                "ALTER SESSION SET CURRENT_SCHEMA = %s" % self._format_schema(self.config.schema)
             )
             cursor.close()
         return self._conn
@@ -105,3 +105,13 @@ class OracleClient:
                     ) from exc
         self._driver = driver
         return driver
+
+    def _format_schema(self, schema: str) -> str:
+        """
+        DDL 不支持绑定，这里做安全格式化；只允许常见标识符字符。
+        """
+        import re
+
+        if re.match(r"^[A-Za-z0-9_#$]+$", schema):
+            return '"%s"' % schema
+        raise ValueError("非法的 schema 名称：%s" % schema)
