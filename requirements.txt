@@ -1,0 +1,2 @@
+oracledb>=1.0
+cx_Oracle>=7.0
